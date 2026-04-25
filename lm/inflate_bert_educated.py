@@ -1106,7 +1106,10 @@ def inflate_AKI(
     inf_layers  = inf_bert.bert.encoder.layer
 
     # Part 1: layers that map 1:1
+    # AKI: new heads/rows are borrowed from the *next* source layer
+    # (the last layer borrows from itself).
     for i in range(no_inflation_depth):
+        aki_src = i if i == orig_depth - 1 else i + 1
         inflate_modBertLayer(
             orig_layers[i], inf_layers[i],
             kqv_heads_pattern=kqv_heads_pattern, kqv_out_pattern=kqv_out_pattern,
@@ -1115,7 +1118,7 @@ def inflate_AKI(
             mlp_in_pattern=mlp_in_pattern,
             ln_pattern=ln_pattern, ln_bias_pattern=ln_bias_pattern,
             mode='AKIproj', out_mode=out_mode, device=device,
-            AKI_layer=orig_layers[i],
+            AKI_layer=orig_layers[aki_src],
             scalezero=scale, scalecirc=scale,
             circ_mode='comp',
         )
@@ -1126,6 +1129,9 @@ def inflate_AKI(
         zi = ni + 1
 
         # normal mapped layer
+        # AKI: borrow new heads/rows from the next source layer
+        # (last layer borrows from itself).
+        aki_src_normal = i if i == orig_depth - 1 else i + 1
         inflate_modBertLayer(
             orig_layers[i], inf_layers[ni],
             kqv_heads_pattern=kqv_heads_pattern, kqv_out_pattern=kqv_out_pattern,
@@ -1134,7 +1140,7 @@ def inflate_AKI(
             mlp_in_pattern=mlp_in_pattern,
             ln_pattern=ln_pattern, ln_bias_pattern=ln_bias_pattern,
             mode='AKIproj', out_mode=out_mode, device=device,
-            AKI_layer=orig_layers[i],
+            AKI_layer=orig_layers[aki_src_normal],
             scalezero=scale, scalecirc=scale,
             circ_mode='comp',
         )
