@@ -1,32 +1,22 @@
-# This python file is for expanding Pre-LN model, note currently we only support unchanged head dimension (dim of each head)
-# Check Pre-LN model defined in preln_bert.py
-# In this file, inflate and expansion are used interchangeably
+# This python file expands Pre-LN BERT models. Currently we only support unchanged
+# head dimension (dim of each head). Check Pre-LN model defined in preln_bert.py.
+# In this file, "inflate" and "expand" are used interchangeably.
 
-import torch.nn as nn
-import torch
 import math
-import torch.nn.functional as F
-from torch import nn
-from transformers import (
-    BertConfig,
-    BertForMaskedLM,
-)
-from preln_bert import (
-    modBertOnlyMLMHead, modBertAttention, modBertLayer, modBertEmbeddings,
-    modBertLMPredictionHead, modBertModel, modBertForMaskedLM,
-)
-from timm.layers.weight_init import trunc_normal_
-from transformers.models.bert.modeling_bert import (
-    BertOnlyMLMHead, BertAttention, BertLayer, BertEmbeddings,
-    BertLMPredictionHead, BertModel,
-)
-import random
+from typing import Optional, Tuple
 
-BertLayerNorm = torch.nn.LayerNorm
-
-import torch.nn.init as init
+import torch
+import torch.nn as nn
 from torch import Tensor
-from typing import Tuple, Union, Optional
+
+from preln_bert import (
+    modBertAttention,
+    modBertEmbeddings,
+    modBertForMaskedLM,
+    modBertLayer,
+    modBertLMPredictionHead,
+)
+from transformers.models.bert.modeling_bert import BertEmbeddings
 
 try:
     from .educated_expand_ops import apply_educated_noise
@@ -70,7 +60,7 @@ def _apply_symmetric_in_split_noise(
 
 
 # ---------------------------------------------------------------------------
-# Optimizer state inflation helper
+# Optimizer state inflation helpers
 # ---------------------------------------------------------------------------
 
 def _inflate_optimizer_state(
@@ -79,20 +69,17 @@ def _inflate_optimizer_state(
     orig_optimizer: Optional[torch.optim.Optimizer],
     inf_optimizer: Optional[torch.optim.Optimizer],
     *,
-    # Shape info needed to reconstruct the block structure
     head_old: int,
     out_old: int,
     in_old: int,
     head_new: int,
     out_new: int,
     in_new: int,
-    # Patterns — same ones used for the weight
     head_pattern: str,
     out_pattern: str,
     in_pattern: str,
     scalecirc: float,
     noise_sigma: float,
-    # Whether this is a 3-D (MHA) or 2-D (linear) param
     flag_with_head: bool,
 ):
     """
@@ -102,65 +89,47 @@ def _inflate_optimizer_state(
 
     Rules
     -----
-    - exp_avg   : inflated with the same pattern as the weight (moment
-                  lives in the same space as the gradient, which lives in
-                  the same space as the weight).
-    - exp_avg_sq: inflated with the *absolute* version of the pattern —
-                  we never want signed cancellation in the second moment
-                  because it tracks squared magnitudes.  Concretely:
-                    symmetric / symmetric_scaled -> replicate + scale,
-                    no signed noise (noise_sigma=0 for sq).
-    - step      : reset to 0 (fresh start requested by caller).
+    - exp_avg   : inflated with the same pattern as the weight.
+    - exp_avg_sq: inflated with the *absolute* version of the pattern --
+                  no signed noise (squared moment must stay non-negative).
+    - step      : reset to 0 (fresh start).
     """
     if orig_optimizer is None or inf_optimizer is None:
         return
     if orig_param is None or inf_param is None:
         return
     if orig_param not in orig_optimizer.state:
-        return  # orig param never stepped — nothing to transfer
+        return
 
     orig_state = orig_optimizer.state[orig_param]
 
-    # Ensure inf_optimizer has a state dict for inf_param (it might be empty
-    # if inf_optimizer was just constructed and never stepped).
     if inf_param not in inf_optimizer.state:
         inf_optimizer.state[inf_param] = {}
 
     inf_state = inf_optimizer.state[inf_param]
 
-    # Always give a fresh step counter
     if "step" in orig_state:
         inf_state["step"] = torch.zeros_like(orig_state["step"])
     else:
         inf_state["step"] = torch.tensor(0, dtype=torch.long)
 
-    in_divisor = in_new // in_old  # exact multiple guaranteed by caller
-    out_divisor = out_new // out_old
-    head_divisor = head_new // head_old
+    in_divisor = in_new // in_old
 
     for key in ("exp_avg", "exp_avg_sq"):
         if key not in orig_state:
             continue
 
-        s = orig_state[key].detach().clone()  # original state tensor
+        s = orig_state[key].detach().clone()
 
-        # Reshape to 3-D [head, out, in] to mirror project_linear's view
         if flag_with_head:
-            # s is [head_old * out_old, in_old] stored flat
             s = s.reshape(head_old, out_old, in_old)
         else:
-            s = s.unsqueeze(0)  # [1, out_old, in_old]
+            s = s.unsqueeze(0)
 
-        # --- expand out dim ---
         s = inflate(s, out_new, dim=1, pattern=out_pattern)
-        # --- expand head dim ---
         s = inflate(s, head_new, dim=0, pattern=head_pattern)
-        # s is now [head_new, out_new, in_old]
 
-        # --- expand in dim ---
         if in_pattern in ("symmetric", "symmetric_scaled"):
-            # Replicate along in-dim then scale — same as weight path.
-            # For exp_avg_sq we skip signed noise (always non-negative).
             w = s.unsqueeze(2).repeat(1, 1, in_divisor, 1)
             if in_pattern == "symmetric":
                 w = w / in_divisor
@@ -168,10 +137,6 @@ def _inflate_optimizer_state(
                 w = w * (scalecirc / in_divisor)
             s = w.reshape(head_new, out_new, in_new)
 
-            # For exp_avg only: inject the same ±e noise so the momentum
-            # is consistent with the weight perturbation direction.
-            # For exp_avg_sq: no signed noise (squared moment must stay ≥ 0
-            # and we don't want cancellation artifacts).
             if key == "exp_avg" and noise_sigma > 0.0:
                 s = _apply_symmetric_in_split_noise(
                     s,
@@ -182,18 +147,15 @@ def _inflate_optimizer_state(
                     in_pattern=in_pattern,
                 )
         else:
-            # Classic circular/average/zero — just replicate
             s = inflate(s, in_new, dim=2, pattern=in_pattern)
 
-        # Flatten back to 2-D
         if flag_with_head:
             s = s.reshape(head_new * out_new, in_new)
         else:
-            s = s.squeeze(0)  # [out_new, in_new]
+            s = s.squeeze(0)
 
         inf_state[key] = s.to(inf_param.device)
 
-    # Copy any remaining scalar / non-tensor state entries
     for k, v in orig_state.items():
         if k not in ("exp_avg", "exp_avg_sq", "step"):
             inf_state[k] = v
@@ -211,13 +173,6 @@ def _inflate_optimizer_state_1d(
     """
     Inflate Adam optimizer state for 1-D parameters (biases, LayerNorm
     weight/bias) and 2-D embedding tables (inflated along dim=1).
-
-    Handles three shapes:
-      - 1-D [features_old]              -> [features_new]          (bias / LN)
-      - 2-D [vocab, features_old]       -> [vocab, features_new]   (embeddings)
-
-    exp_avg_sq never receives signed noise — it is always non-negative.
-    step is reset to 0 (fresh start).
     """
     if orig_optimizer is None or inf_optimizer is None:
         return
@@ -242,10 +197,8 @@ def _inflate_optimizer_state_1d(
             continue
         s = orig_state[key].detach().clone()
         if s.dim() == 1:
-            # bias / LN param: [features_old] -> [features_new]
             s = inflate(s, features_new, dim=0, pattern=pattern)
         elif s.dim() == 2:
-            # embedding table: [vocab, features_old] -> [vocab, features_new]
             s = inflate(s, features_new, dim=1, pattern=pattern)
         inf_state[key] = s.to(inf_param.device)
 
@@ -304,7 +257,6 @@ def inflate(
                 * torch.mean(features, dim=dim, keepdim=True)
             )
         elif pattern == 'unif':
-            print('Use 1.0 for unif')
             features_ = 2 * torch.rand(
                 features.size()[:dim] + (residue,) + features.size()[dim + 1:]
             ).to(device) - 1
@@ -313,7 +265,6 @@ def inflate(
                 features.size()[:dim] + (residue,) + features.size()[dim + 1:]
             ).to(device)
         elif pattern == 'unif01':
-            print('Unif 0-1')
             features_ = torch.rand(
                 features.size()[:dim] + (residue,) + features.size()[dim + 1:]
             ).to(device)
@@ -384,9 +335,6 @@ def project_linear(
                     in_old, in_new, in_residue)
             )
 
-        print('Use symmetric (net2net split): in_divisor={}, scalecirc={}, noise_sigma={}'.format(
-            in_divisor, scalecirc, noise_sigma))
-
         w = weight.unsqueeze(2).repeat(1, 1, in_divisor, 1)
 
         if in_pattern == 'symmetric':
@@ -416,25 +364,20 @@ def project_linear(
     # CLASSIC PATHS (circular / average / zero)
     # ==========================================================================
     if in_residue == 0:
-        print('Width is divisible.')
-
         if cancel:
             assert weight.abs().sum() == 0
-            print('cancelzero, R.V. scale={}'.format(scalecancel))
             weight_ = weight_ * scalecancel
             weight_ = weight_.reshape(head_new, out_new, in_divisor, in_old)
             weight = weight_ - (weight_.sum(dim=2) - weight).unsqueeze(2).repeat(1, 1, in_divisor, 1) / in_divisor
             final_weight = weight.reshape(head_new, out_new, in_new)
 
         elif circ_mode == 'projection':
-            print('projection circular (from {}) R.V. scale={}'.format(in_pattern, scalecirc))
             weight_ = weight_ * scalecirc
             weight_ = weight_.reshape(head_new, out_new, in_divisor, in_old)
             weight = weight_ - (weight_.sum(dim=2) - weight).unsqueeze(2).repeat(1, 1, in_divisor, 1) / in_divisor
             final_weight = weight.reshape(head_new, out_new, in_new)
 
         elif circ_mode == 'comp':
-            print('comp circular (from {}) R.V. scale={}'.format(in_pattern, scalecirc))
             assert in_divisor == 2, 'comp circ mode only supports in_divisor == 2'
             weight_ = weight_.reshape(head_new, out_new, in_divisor, in_old)[:, :, 0, :] * scalecirc
             weight_compensate = (weight - weight_).detach().clone()
@@ -448,10 +391,8 @@ def project_linear(
             if cancel or circ_mode == 'projection':
                 if cancel:
                     assert weight.abs().sum() == 0
-                    print('cancelzero (residue), R.V. scale={}'.format(scalecancel))
                     weight_ = weight_ * scalecancel
                 else:
-                    print('projection circular (residue) R.V. scale={}'.format(scalecirc))
                     weight_ = weight_ * scalecirc
                 weight_0_, weight_r_ = weight_.split([in_divisor * in_old, in_residue], dim=2)
                 weight_0_ = weight_0_.reshape(head_new, out_new, in_divisor, in_old)
@@ -467,7 +408,6 @@ def project_linear(
                 weight_r = weight_r.squeeze(2)
 
             elif circ_mode == 'comp':
-                print('comp circular (residue) scale={}'.format(scalecirc))
                 weight_0_, weight_r_ = weight_.split([in_divisor * in_old, in_residue], dim=2)
                 weight_0_ = weight_0_.reshape(head_new, out_new, in_divisor, in_old)
 
@@ -490,10 +430,8 @@ def project_linear(
             weight_0 = weight_0_ - (weight_0_.sum(dim=2) - weight).unsqueeze(2).repeat(1, 1, in_divisor, 1) / in_divisor
 
             if in_pattern == 'average':
-                print('average residue expansion.')
                 weight_r = weight_r_ - weight_r_.sum(dim=2).unsqueeze(2).repeat(1, 1, in_residue) / in_residue
             elif in_pattern == 'zero':
-                print('zero residue expansion, scale={}'.format(scalezero))
                 weight_r = weight_r_ * scalezero
             else:
                 raise
@@ -509,7 +447,7 @@ def project_linear(
 
 
 # ---------------------------------------------------------------------------
-# inflate_fc_nonint_heads — dispatch wrapper + optimizer state transfer
+# inflate_fc_nonint_heads -- dispatch wrapper + optimizer state transfer
 # ---------------------------------------------------------------------------
 
 def inflate_fc_nonint_heads(
@@ -520,7 +458,6 @@ def inflate_fc_nonint_heads(
     AKI_weight=None, AKI_bias=None, indices=None,
     scalezero=1.0, scalecancel=1.0, scalecirc=1.0,
     circ_mode='projection', noise_sigma: float = 0.0,
-    # --- optimizer state transfer ---
     orig_param: Optional[nn.Parameter] = None,
     inf_param: Optional[nn.Parameter] = None,
     orig_optimizer: Optional[torch.optim.Optimizer] = None,
@@ -529,14 +466,6 @@ def inflate_fc_nonint_heads(
     """
     Function-preserving expansion of a fully-connected or multi-head-attention
     weight tensor, with optional in-place optimizer state transfer.
-
-    New parameters
-    --------------
-    orig_param      : the nn.Parameter in orig_bert whose state lives in orig_optimizer
-    inf_param       : the nn.Parameter in inf_bert that inf_optimizer should track
-    orig_optimizer  : AdamW / Adam optimizer associated with orig_bert (already stepped)
-    inf_optimizer   : freshly constructed optimizer associated with inf_bert
-                      (its state for inf_param will be populated here)
     """
     flag_with_head = True
     if len(orig_weight.size()) == 2:
@@ -564,7 +493,6 @@ def inflate_fc_nonint_heads(
     # Mode pre-processing
     # ------------------------------------------------------------------
     if mode == 'net2net':
-        print('Use net2net')
         assert circ_mode == 'projection'
         inf_weight = torch.zeros_like(inf_weight)
 
@@ -575,9 +503,6 @@ def inflate_fc_nonint_heads(
         if mode == 'AKI':
             inf_weight = torch.zeros_like(inf_weight)
             assert circ_mode == 'projection'
-            print('AKI, in_pattern={}'.format(in_pattern))
-        else:
-            print('AKIproj, in_pattern={}'.format(in_pattern))
         if flag_with_head:
             delta = new_heads - heads
             orig_weight = torch.cat([orig_weight, AKI_weight[:delta].detach().clone()], dim=0)
@@ -588,13 +513,11 @@ def inflate_fc_nonint_heads(
             orig_bias   = torch.cat([orig_bias,   AKI_bias[:, :delta].detach().clone()], dim=1) if orig_bias is not None else None
 
     elif mode == 'cancelzero':
-        print('Use cancelzero')
         orig_weight = torch.zeros_like(orig_weight)
         if orig_bias is not None:
             orig_bias = torch.zeros_like(orig_bias)
 
     elif mode == 'allzero':
-        print('Use allzero')
         zero_weight = torch.zeros_like(inf_weight)
         zero_bias   = None
         if orig_bias is not None:
@@ -602,11 +525,9 @@ def inflate_fc_nonint_heads(
             zero_bias = torch.zeros(h_new * o_new).to(device)
         if not flag_with_head:
             zero_weight = zero_weight.squeeze(0)
-        # allzero: optimizer state for inf_param is left as zeros (fresh start)
         return zero_weight, zero_bias
 
     elif mode == 'nearzero':
-        print('Use nearzero')
         small_weight = inf_weight.detach().clone() / 10
         small_bias   = None
         if orig_bias is not None:
@@ -615,9 +536,6 @@ def inflate_fc_nonint_heads(
         if not flag_with_head:
             small_weight = small_weight.squeeze(0)
         return small_weight, small_bias
-
-    elif mode == 'proj':
-        print('proj, in_pattern={}, circ_mode={}'.format(in_pattern, circ_mode))
 
     # ------------------------------------------------------------------
     # Capture pre-expansion shape for optimizer state inflation
@@ -644,7 +562,7 @@ def inflate_fc_nonint_heads(
     )
 
     # ------------------------------------------------------------------
-    # Optimizer state transfer (Option A: done right here after expansion)
+    # Optimizer state transfer
     # ------------------------------------------------------------------
     _inflate_optimizer_state(
         orig_param=orig_param,
@@ -681,7 +599,6 @@ def inflate_fc_nonint_heads(
 def _apply_embedding_noise(tensor, d_old: int, noise_sigma: float):
     if noise_sigma <= 0.0:
         return tensor
-    import torch
     N, d_new = tensor.shape
     D = d_new // d_old
     if D < 2:
@@ -964,8 +881,6 @@ def inflate_modBertAttention(
             inf_att.output.dense.bias.data = inf_proj_bias.data
 
     # Transfer bias optimizer states (1-D, inflate along the head*out dim)
-    _inf_embed = inf_att.self.all_head_size
-    _orig_embed = orig_att.self.all_head_size
     if orig_att.self.query.bias is not None and inf_att.self.query.bias is not None:
         for orig_b, inf_b in [
             (orig_att.self.query.bias,  inf_att.self.query.bias),
@@ -984,12 +899,10 @@ def inflate_modBertAttention(
         )
 
     if mode in ('AKI', 'net2net'):
-        print('LN: bert2bert style')
         inflate_ln_bert2bert(orig_att.LayerNorm, inf_att.LayerNorm,
                              pattern=ln_pattern, bias_pattern=ln_bias_pattern, device=device,
                              orig_optimizer=orig_optimizer, inf_optimizer=inf_optimizer)
     else:
-        print('LN: educated style')
         inflate_ln(orig_att.LayerNorm, inf_att.LayerNorm,
                    pattern=ln_pattern, bias_pattern=ln_bias_pattern, device=device,
                    orig_optimizer=orig_optimizer, inf_optimizer=inf_optimizer)
@@ -1118,13 +1031,11 @@ def inflate_modBertLayer(
         )
 
     if mode in ('AKI', 'net2net'):
-        print('LN (MLP): bert2bert style')
         inflate_ln_bert2bert(
             orig_layer.intermediate.LayerNorm, inf_layer.intermediate.LayerNorm,
             pattern=ln_pattern, bias_pattern=ln_bias_pattern, device=device,
             orig_optimizer=orig_optimizer, inf_optimizer=inf_optimizer)
     else:
-        print('LN (MLP): educated style')
         inflate_ln(
             orig_layer.intermediate.LayerNorm, inf_layer.intermediate.LayerNorm,
             pattern=ln_pattern, bias_pattern=ln_bias_pattern, device=device,
@@ -1148,7 +1059,7 @@ def inflate_modBertLMPredictionHead(orig_layer, inf_layer, decoder_out_pattern):
 
 
 # ---------------------------------------------------------------------------
-# inflate_LEMON — original LEMON recipe (unchanged semantics)
+# inflate_LEMON -- original LEMON recipe
 # ---------------------------------------------------------------------------
 
 def inflate_LEMON(
@@ -1192,7 +1103,6 @@ def inflate_LEMON(
     inf_layers  = inf_bert.bert.encoder.layer
 
     for i in range(no_inflation_depth):
-        print('LEMON: normal inflate layer {}'.format(i))
         inflate_modBertLayer(
             orig_layers[i], inf_layers[i],
             kqv_heads_pattern=kqv_heads_pattern, kqv_out_pattern=kqv_out_pattern,
@@ -1208,7 +1118,6 @@ def inflate_LEMON(
     for i in range(no_inflation_depth, orig_depth):
         ni = no_inflation_depth + (i - no_inflation_depth) * 2
         zi = ni + 1
-        print('LEMON: normal inflate Orig {} -> Inf {}'.format(i, ni))
         inflate_modBertLayer(
             orig_layers[i], inf_layers[ni],
             kqv_heads_pattern=kqv_heads_pattern, kqv_out_pattern=kqv_out_pattern,
@@ -1222,8 +1131,6 @@ def inflate_LEMON(
         )
         if inflate_new_layers:
             aki_layer = orig_layers[i if i == orig_depth - 1 else i + 1]
-            print('LEMON: zero inflate Orig {} -> Inf {} (AKI from {})'.format(
-                i, zi, i if i == orig_depth - 1 else i + 1))
             inflate_modBertLayer(
                 orig_layers[i], inf_layers[zi],
                 kqv_heads_pattern=kqv_heads_pattern, kqv_out_pattern=kqv_out_pattern,
@@ -1235,8 +1142,6 @@ def inflate_LEMON(
                 scalezero=depth_scalezero, scalecirc=depth_scalecirc,
                 circ_mode=depth_circ_mode,
             )
-        else:
-            print('LEMON: skipping depth layer {}'.format(zi))
 
     inflate_ln(
         orig_bert.bert.encoder.ln_f, inf_bert.bert.encoder.ln_f,
@@ -1250,33 +1155,10 @@ def inflate_LEMON(
 
 
 # ---------------------------------------------------------------------------
-# inflate_LEMON_educated — symmetric / net2net-style split
+# inflate_hyperclone -- symmetric / net2net-style split with optimizer transfer
 # ---------------------------------------------------------------------------
 
-def _snapshot(module):
-    return {name: param.detach().clone() for name, param in module.named_parameters()}
-
-
-def _print_snap(snap, indent='  '):
-    pass
-
-def _print_diff(before, after, indent='  '):
-    pass
-
-
-def _section(title, width=80):
-    bar = '=' * width
-    pad = max(0, (width - len(title) - 2) // 2)
-    print('\n{}\n{} {} {}\n{}'.format(bar, '=' * pad, title, '=' * pad, bar))
-
-
-def _subsection(title, width=80):
-    print('\n' + '-' * width)
-    print('  ' + title)
-    print('-' * width)
-
-
-def inflate_LEMON_educated(
+def inflate_hyperclone(
     orig_bert,
     inf_bert,
     mode: str = 'proj',
@@ -1297,13 +1179,13 @@ def inflate_LEMON_educated(
       1. Train / step orig_bert with orig_optimizer (at least one step).
       2. Instantiate inf_bert (same architecture but larger).
       3. Construct inf_optimizer over inf_bert.parameters() (not yet stepped).
-      4. Call inflate_LEMON_educated(..., orig_optimizer=orig_optimizer,
-                                        inf_optimizer=inf_optimizer).
+      4. Call inflate_hyperclone(..., orig_optimizer=orig_optimizer,
+                                       inf_optimizer=inf_optimizer).
 
     After this call inf_optimizer will have inflated exp_avg / exp_avg_sq for
     every parameter that was copied from orig_bert, and step=0 for all params
-    (fresh momentum start as requested).  Parameters belonging to new depth
-    layers (the identity copies) will have zeroed optimizer state.
+    (fresh momentum start). Parameters belonging to new depth layers (the
+    identity copies) will have zeroed optimizer state.
     """
     assert isinstance(orig_bert, modBertForMaskedLM)
     assert isinstance(inf_bert,  modBertForMaskedLM)
@@ -1313,9 +1195,9 @@ def inflate_LEMON_educated(
     assert orig_depth * 2 >= inf_depth, \
         'inf_depth must be <= 2 * orig_depth'
 
-    # ------------------------------------------------------------------ #
-    # Pattern table                                                         #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Pattern table
+    # ------------------------------------------------------------------
     embedding_pattern  = 'average'
     ln_pattern         = 'unif'
     ln_bias_pattern    = 'zero'
@@ -1336,7 +1218,6 @@ def inflate_LEMON_educated(
     orig_layers = orig_bert.bert.encoder.layer
     inf_layers  = inf_bert.bert.encoder.layer
 
-    # Shared kwargs for normal-copy layer calls
     _layer_kw = dict(
         kqv_heads_pattern=kqv_heads_pattern,
         kqv_out_pattern=kqv_out_pattern,
@@ -1356,16 +1237,9 @@ def inflate_LEMON_educated(
         inf_optimizer=inf_optimizer,
     )
 
-    # ================================================================== #
+    # ------------------------------------------------------------------
     # EMBEDDINGS
-    # (Embedding optimizer state is not inflated here — embeddings use
-    #  'average' pattern which is not covered by _inflate_optimizer_state's
-    #  symmetric path.  They receive zeroed state, which is fine since
-    #  embeddings are sparse and their moments reset quickly.)
-    # ================================================================== #
-    _section('EMBEDDINGS')
-
-    snap_orig = _snapshot(orig_bert.bert.embeddings)
+    # ------------------------------------------------------------------
     inflate_BertEmbeddings(
         orig_bert.bert.embeddings, inf_bert.bert.embeddings,
         pattern=embedding_pattern,
@@ -1374,7 +1248,6 @@ def inflate_LEMON_educated(
         noise_sigma=noise_sigma,
     )
 
-    # Transfer embedding optimizer states (2-D tables, inflate hidden dim)
     for orig_emb, inf_emb in [
         (orig_bert.bert.embeddings.word_embeddings.weight,
          inf_bert.bert.embeddings.word_embeddings.weight),
@@ -1387,7 +1260,6 @@ def inflate_LEMON_educated(
             orig_emb, inf_emb, orig_optimizer, inf_optimizer,
             features_new=inf_emb.size(1), pattern=embedding_pattern,
         )
-    # Transfer embedding LayerNorm state if present
     if hasattr(orig_bert.bert.embeddings, 'LayerNorm'):
         inflate_ln(
             orig_bert.bert.embeddings.LayerNorm,
@@ -1396,56 +1268,26 @@ def inflate_LEMON_educated(
             orig_optimizer=orig_optimizer, inf_optimizer=inf_optimizer,
         )
 
-    _subsection('orig embeddings')
-    _print_snap(snap_orig)
-    _subsection('inf  embeddings — after')
-    _print_snap(_snapshot(inf_bert.bert.embeddings))
-
-    # ================================================================== #
+    # ------------------------------------------------------------------
     # WIDTH-ONLY LAYERS
-    # ================================================================== #
-    _section('WIDTH-ONLY LAYERS  (orig layers 0..{})'.format(no_inflation_depth - 1))
-
+    # ------------------------------------------------------------------
     for i in range(no_inflation_depth):
-        _subsection('Layer {}  orig[{}] -> inf[{}]  (width-only)'.format(i, i, i))
-
-        snap_orig = _snapshot(orig_layers[i])
         inflate_modBertLayer(orig_layers[i], inf_layers[i], **_layer_kw)
 
-        print('  [orig layer {}]'.format(i))
-        _print_snap(snap_orig)
-        print('  [inf  layer {} — after]'.format(i))
-        _print_snap(_snapshot(inf_layers[i]))
-
-    # ================================================================== #
+    # ------------------------------------------------------------------
     # WIDTH + DEPTH LAYERS
-    # ================================================================== #
-    _section('WIDTH + DEPTH LAYERS  (orig layers {}..{})'.format(
-        no_inflation_depth, orig_depth - 1))
-
+    # ------------------------------------------------------------------
     for i in range(no_inflation_depth, orig_depth):
         ni = no_inflation_depth + (i - no_inflation_depth) * 2
         zi = ni + 1
 
-        # Normal (function-preserving) copy — state transferred
-        _subsection('Layer {}  orig[{}] -> inf[{}]  (normal copy)'.format(i, i, ni))
-
-        snap_orig = _snapshot(orig_layers[i])
+        # Normal (function-preserving) copy -- state transferred
         inflate_modBertLayer(orig_layers[i], inf_layers[ni], **_layer_kw)
 
-        print('  [orig layer {}]'.format(i))
-        _print_snap(snap_orig)
-        print('  [inf  layer {} — after]'.format(ni))
-        _print_snap(_snapshot(inf_layers[ni]))
-
-        # Identity copy (depth expansion) — no orig state to transfer,
-        # so we pass orig_optimizer=None to leave inf state zeroed.
+        # Identity copy (depth expansion) -- no orig state to transfer
         if inflate_new_layers:
             aki_src = i if i == orig_depth - 1 else i + 1
             aki_layer = orig_layers[aki_src]
-
-            _subsection('Layer {}  orig[{}] -> inf[{}]  (identity copy, AKI from orig[{}])'.format(
-                i, i, zi, aki_src))
 
             inflate_modBertLayer(
                 orig_layers[i], inf_layers[zi],
@@ -1466,24 +1308,13 @@ def inflate_LEMON_educated(
                 scalecirc=depth_scalecirc,
                 circ_mode=circ_mode,
                 noise_sigma=noise_sigma,
-                orig_optimizer=None,       # new depth layer — leave state zeroed
+                orig_optimizer=None,       # new depth layer -- leave state zeroed
                 inf_optimizer=inf_optimizer,
             )
 
-            print('  [orig layer {}]'.format(i))
-            _print_snap(snap_orig)
-            print('  [inf  layer {} — after]'.format(zi))
-            _print_snap(_snapshot(inf_layers[zi]))
-
-        else:
-            _subsection('Layer {}  inf[{}]  (depth layer — skipped)'.format(i, zi))
-
-    # ================================================================== #
+    # ------------------------------------------------------------------
     # FINAL ENCODER LAYERNORM
-    # ================================================================== #
-    _section('FINAL ENCODER LAYERNORM')
-
-    snap_orig = _snapshot(orig_bert.bert.encoder.ln_f)
+    # ------------------------------------------------------------------
     inflate_ln(
         orig_bert.bert.encoder.ln_f,
         inf_bert.bert.encoder.ln_f,
@@ -1495,24 +1326,16 @@ def inflate_LEMON_educated(
         inf_optimizer=inf_optimizer,
     )
 
-    _subsection('orig ln_f')
-    _print_snap(snap_orig)
-    _subsection('inf  ln_f — after')
-    _print_snap(_snapshot(inf_bert.bert.encoder.ln_f))
-
-    # ================================================================== #
+    # ------------------------------------------------------------------
     # MLM DECODER HEAD
-    # ================================================================== #
-    _section('MLM DECODER HEAD')
-
-    snap_orig = _snapshot(orig_bert.cls.predictions)
+    # ------------------------------------------------------------------
     inflate_modBertLMPredictionHead(
         orig_bert.cls.predictions,
         inf_bert.cls.predictions,
         decoder_out_pattern=decoder_out_pattern,
     )
 
-    # predictions.bias is vocab-sized and unchanged — copy state directly
+    # predictions.bias is vocab-sized and unchanged -- copy state directly
     if orig_optimizer is not None and inf_optimizer is not None:
         orig_bias_p = orig_bert.cls.predictions.bias
         inf_bias_p  = inf_bert.cls.predictions.bias
@@ -1527,355 +1350,3 @@ def inflate_LEMON_educated(
                     inf_s[key] = orig_s[key].detach().clone().to(inf_bias_p.device)
             inf_s["step"] = torch.zeros_like(orig_s["step"]) if "step" in orig_s \
                 else torch.tensor(0, dtype=torch.long)
-
-    _subsection('orig predictions')
-    _print_snap(snap_orig)
-    _subsection('inf  predictions — after')
-    _print_snap(_snapshot(inf_bert.cls.predictions))
-
-    _section('INFLATION COMPLETE')
-
-
-def inflate_AKI(
-    orig_bert, inf_bert,
-    device='cpu',
-    inflate_new_layers=True,
-    out_mode='allzero',
-    ln_pattern='unif',
-    ln_bias_pattern='zero',
-    kqv_heads_pattern='circular',
-    kqv_out_pattern='circular',
-    kqv_in_pattern='zero',
-    proj_out_pattern='average',
-    mlp_out_pattern='average',
-    mlp_hidden_pattern='circular',
-    mlp_in_pattern='zero',
-    decoder_out_pattern='circular',
-    scale=0.1,
-):
-    """
-    AKI-style BERT inflation:
-    - normal mapped layers use mode='AKIproj'
-    - inserted depth layers also use mode='AKIproj'
-    """
-    assert isinstance(orig_bert, modBertForMaskedLM)
-    assert isinstance(inf_bert,  modBertForMaskedLM)
-
-    orig_depth = len(orig_bert.bert.encoder.layer)
-    inf_depth  = len(inf_bert.bert.encoder.layer)
-    assert orig_depth * 2 >= inf_depth
-
-    # embeddings
-    inflate_BertEmbeddings(
-        orig_bert.bert.embeddings, inf_bert.bert.embeddings,
-        pattern='average',
-        ln_pattern=ln_pattern,
-        ln_bias_pattern=ln_bias_pattern,
-    )
-
-    no_inflation_depth = 2 * orig_depth - inf_depth
-    orig_layers = orig_bert.bert.encoder.layer
-    inf_layers  = inf_bert.bert.encoder.layer
-
-    # Part 1: layers that map 1:1
-    for i in range(no_inflation_depth):
-        print(f'AKI: inflate layer {i}')
-        inflate_modBertLayer(
-            orig_layers[i], inf_layers[i],
-            kqv_heads_pattern=kqv_heads_pattern, kqv_out_pattern=kqv_out_pattern,
-            kqv_in_pattern=kqv_in_pattern, proj_out_pattern=proj_out_pattern,
-            mlp_out_pattern=mlp_out_pattern, mlp_hidden_pattern=mlp_hidden_pattern,
-            mlp_in_pattern=mlp_in_pattern,
-            ln_pattern=ln_pattern, ln_bias_pattern=ln_bias_pattern,
-            mode='AKIproj', out_mode=out_mode, device=device,
-            AKI_layer=orig_layers[i],  # AKI reference
-            scalezero=scale, scalecirc=scale,
-            circ_mode='comp',
-        )
-
-    # Part 2: layers that map to (normal, inserted)
-    for i in range(no_inflation_depth, orig_depth):
-        ni = no_inflation_depth + (i - no_inflation_depth) * 2
-        zi = ni + 1
-
-        # normal mapped layer
-        print(f'AKI: Orig {i} -> Inf {ni}')
-        inflate_modBertLayer(
-            orig_layers[i], inf_layers[ni],
-            kqv_heads_pattern=kqv_heads_pattern, kqv_out_pattern=kqv_out_pattern,
-            kqv_in_pattern=kqv_in_pattern, proj_out_pattern=proj_out_pattern,
-            mlp_out_pattern=mlp_out_pattern, mlp_hidden_pattern=mlp_hidden_pattern,
-            mlp_in_pattern=mlp_in_pattern,
-            ln_pattern=ln_pattern, ln_bias_pattern=ln_bias_pattern,
-            mode='AKIproj', out_mode=out_mode, device=device,
-            AKI_layer=orig_layers[i],
-            scalezero=scale, scalecirc=scale,
-            circ_mode='comp',
-        )
-
-        # inserted layer
-        if inflate_new_layers:
-            aki_layer = orig_layers[i if i == orig_depth - 1 else i + 1]
-            print(f'AKI: Orig {i} -> Inf {zi} (AKI from {i if i == orig_depth - 1 else i + 1})')
-            inflate_modBertLayer(
-                orig_layers[i], inf_layers[zi],
-                kqv_heads_pattern=kqv_heads_pattern, kqv_out_pattern=kqv_out_pattern,
-                kqv_in_pattern=kqv_in_pattern, proj_out_pattern=proj_out_pattern,
-                mlp_out_pattern=mlp_out_pattern, mlp_hidden_pattern=mlp_hidden_pattern,
-                mlp_in_pattern=mlp_in_pattern,
-                ln_pattern=ln_pattern, ln_bias_pattern=ln_bias_pattern,
-                mode='AKIproj', out_mode=out_mode, device=device,
-                AKI_layer=aki_layer,
-                scalezero=scale, scalecirc=scale,
-                circ_mode='comp',
-            )
-        else:
-            print(f'AKI: skipping inserted layer {zi}')
-
-    inflate_ln(
-        orig_bert.bert.encoder.ln_f, inf_bert.bert.encoder.ln_f,
-        pattern=ln_pattern, bias_pattern=ln_bias_pattern,
-        scale_for_bert=True, device=device,
-    )
-    inflate_modBertLMPredictionHead(
-        orig_bert.cls.predictions, inf_bert.cls.predictions,
-        decoder_out_pattern=decoder_out_pattern,
-    )
-
-
-def inflate_FPI(orig_bert, inf_bert, mode='proj', device='cpu', inflate_new_layers=True,
-                orig_circ_mode='comp', depth_circ_mode='comp',
-                orig_scalezero=0.1, orig_scalecirc=0.1,
-                depth_scalezero=0.1, depth_scalecirc=0.1):
-    """
-    BERT depth/width expansion without bert2BERT-AKI neighbor weights (FPI-style).
-    Mapped layers use LEMON projection (``mode``, default ``proj``). Inserted depth
-    layers use the same projection for Q/K/V and MLP fc1, and ``allzero`` for attention
-    output and fc2 — analogous in spirit to ResNet ``inflate_bottleneck_fpi`` (single
-    source, no donor layer).
-    """
-    assert isinstance(orig_bert, modBertForMaskedLM)
-    assert isinstance(inf_bert, modBertForMaskedLM)
-    orig_depth = len(orig_bert.bert.encoder.layer)
-    inf_depth = len(inf_bert.bert.encoder.layer)
-    assert orig_depth * 2 >= inf_depth
-    embedding_pattern = 'average'
-    ln_pattern = 'unif'
-    ln_bias_pattern = 'zero'
-    kqv_heads_pattern = 'circular'
-    kqv_out_pattern = 'circular'
-    kqv_in_pattern = 'zero'
-    proj_out_pattern = 'average'
-    mlp_out_pattern = 'average'
-    mlp_hidden_pattern = 'circular'
-    mlp_in_pattern = 'zero'
-    decoder_out_pattern = 'circular'
-    inflate_BertEmbeddings(
-        orig_bert.bert.embeddings, inf_bert.bert.embeddings,
-        pattern=embedding_pattern, ln_pattern=ln_pattern, ln_bias_pattern=ln_bias_pattern,
-    )
-    no_inflation_depth = 2 * orig_depth - inf_depth
-    orig_layers = orig_bert.bert.encoder.layer
-    inf_layers = inf_bert.bert.encoder.layer
-    for i in range(no_inflation_depth):
-        print('FPI: normal inflate layer {}'.format(i))
-        inflate_modBertLayer(
-            orig_layers[i], inf_layers[i],
-            kqv_heads_pattern=kqv_heads_pattern, kqv_out_pattern=kqv_out_pattern,
-            kqv_in_pattern=kqv_in_pattern, proj_out_pattern=proj_out_pattern,
-            mlp_out_pattern=mlp_out_pattern, mlp_hidden_pattern=mlp_hidden_pattern,
-            mlp_in_pattern=mlp_in_pattern,
-            ln_pattern=ln_pattern, ln_bias_pattern=ln_bias_pattern,
-            mode=mode, device=device,
-            scalezero=orig_scalezero, scalecirc=orig_scalecirc,
-            circ_mode=orig_circ_mode,
-        )
-    for i in range(no_inflation_depth, orig_depth):
-        normal_layer_index = no_inflation_depth + (i - no_inflation_depth) * 2
-        zero_layer_index = normal_layer_index + 1
-        print('FPI: normal inflate from Orig {} to Inf {}'.format(i, normal_layer_index))
-        inflate_modBertLayer(
-            orig_layers[i], inf_layers[normal_layer_index],
-            kqv_heads_pattern=kqv_heads_pattern, kqv_out_pattern=kqv_out_pattern,
-            kqv_in_pattern=kqv_in_pattern, proj_out_pattern=proj_out_pattern,
-            mlp_out_pattern=mlp_out_pattern, mlp_hidden_pattern=mlp_hidden_pattern,
-            mlp_in_pattern=mlp_in_pattern,
-            ln_pattern=ln_pattern, ln_bias_pattern=ln_bias_pattern,
-            mode=mode, device=device,
-            scalezero=orig_scalezero, scalecirc=orig_scalecirc,
-            circ_mode=orig_circ_mode,
-        )
-        if inflate_new_layers:
-            print('FPI: inserted layer from Orig {} to Inf {} (no AKI donor)'.format(
-                i, zero_layer_index))
-            inflate_modBertLayer(
-                orig_layers[i], inf_layers[zero_layer_index],
-                kqv_heads_pattern=kqv_heads_pattern, kqv_out_pattern=kqv_out_pattern,
-                kqv_in_pattern=kqv_in_pattern, proj_out_pattern=proj_out_pattern,
-                mlp_out_pattern=mlp_out_pattern, mlp_hidden_pattern=mlp_hidden_pattern,
-                mlp_in_pattern=mlp_in_pattern,
-                ln_pattern=ln_pattern, ln_bias_pattern=ln_bias_pattern,
-                mode=mode, device=device, out_mode='allzero',
-                scalezero=depth_scalezero, scalecirc=depth_scalecirc,
-                circ_mode=depth_circ_mode,
-            )
-        else:
-            print('FPI: skip Inf layer {}'.format(zero_layer_index))
-    inflate_ln(
-        orig_bert.bert.encoder.ln_f, inf_bert.bert.encoder.ln_f,
-        pattern=ln_pattern, bias_pattern=ln_bias_pattern, scale_for_bert=True, device=device,
-    )
-    inflate_modBertLMPredictionHead(
-        orig_bert.cls.predictions, inf_bert.cls.predictions,
-        decoder_out_pattern=decoder_out_pattern,
-    )
-# ---------------------------------------------------------------------------
-# Test helpers
-# ---------------------------------------------------------------------------
-
-def _make_random_input(vocab_size: int, seq_len: int = 16, batch_size: int = 1):
-    return {
-        "input_ids":      torch.randint(1, vocab_size, (batch_size, seq_len)),
-        "attention_mask": torch.ones(batch_size, seq_len, dtype=torch.long),
-        "token_type_ids": torch.zeros(batch_size, seq_len, dtype=torch.long),
-    }
-
-
-def _load_configs(config_path: str):
-    import json
-    from transformers import BertConfig
-    with open(config_path, encoding="utf-8") as f:
-        raw = json.load(f)
-    try:
-        return BertConfig(**raw["source"]), BertConfig(**raw["destination"])
-    except KeyError as e:
-        raise ValueError(f"{config_path} must have 'source' and 'destination' keys (missing {e})") from e
-
-
-def _get_args_parser(add_help=True):
-    import argparse
-    p = argparse.ArgumentParser(description="BERT educated inflation test", add_help=add_help)
-    p.add_argument("--growth-config", default="./config.json", type=str)
-    p.add_argument("--seq-len", default=16, type=int)
-    p.add_argument("--seed", default=None, type=int)
-    return p
-
-
-def _main(args):
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-
-    modconfig, inf_modconfig = _load_configs(os.path.abspath(args.growth_config))
-    print("source config:\n", modconfig)
-    print("destination config:\n", inf_modconfig)
-
-    # ------------------------------------------------------------------ #
-    # Build small model + optimizer
-    # ------------------------------------------------------------------ #
-    modmodel = modBertForMaskedLM(modconfig)
-    modmodel.train()
-
-    orig_optimizer = torch.optim.AdamW(modmodel.parameters(), lr=1e-4)
-
-    rand_input = _make_random_input(modconfig.vocab_size, seq_len=args.seq_len)
-    print("\n=== Random input token ids ===")
-    print(rand_input["input_ids"])
-
-    # ------------------------------------------------------------------ #
-    # Step 1: one forward + backward + optimizer step on small model
-    # ------------------------------------------------------------------ #
-    _section('SMALL MODEL — forward / backward / step')
-
-    out_before_step = modmodel(**rand_input)
-    loss = out_before_step["logits"].sum()   # dummy scalar loss
-    loss.backward()
-    orig_optimizer.step()
-    orig_optimizer.zero_grad()
-
-    modmodel.eval()
-    with torch.no_grad():
-        small_out = modmodel(**rand_input)
-
-    small_logits = small_out["logits"]
-    print("small model logits sum (post-step): {}".format(small_logits.sum().item()))
-
-    # ------------------------------------------------------------------ #
-    # Step 2: build large model + fresh optimizer
-    # ------------------------------------------------------------------ #
-    _section('BUILDING LARGE MODEL + FRESH OPTIMIZER')
-
-    inf_modmodel = modBertForMaskedLM(inf_modconfig)
-    inf_optimizer = torch.optim.AdamW(inf_modmodel.parameters(), lr=1e-4)
-
-    # ------------------------------------------------------------------ #
-    # Step 3: inflate weights + transfer optimizer state
-    # ------------------------------------------------------------------ #
-    _section('INFLATING WEIGHTS + TRANSFERRING OPTIMIZER STATE')
-
-    inflate_LEMON_educated(
-        modmodel,
-        inf_modmodel,
-        orig_optimizer=orig_optimizer,
-        inf_optimizer=inf_optimizer,
-    )
-
-    # ------------------------------------------------------------------ #
-    # Step 4: forward pass on large model and compare
-    # ------------------------------------------------------------------ #
-    _section('LARGE MODEL — forward pass comparison')
-
-    inf_modmodel.eval()
-    with torch.no_grad():
-        large_out = inf_modmodel(**rand_input)
-
-    large_logits = large_out["logits"]
-
-    print("\n  small logits shape : {}".format(list(small_logits.shape)))
-    print("  large logits shape : {}".format(list(large_logits.shape)))
-    print("\n  small logits sum   : {:.6f}".format(small_logits.sum().item()))
-    print("  large logits sum   : {:.6f}".format(large_logits.sum().item()))
-
-    diff = (large_logits - small_logits).abs().max().item()
-    print("\n  max |large - small| (function-preserving error) : {:.3e}".format(diff))
-
-    # ------------------------------------------------------------------ #
-    # Step 5: sanity-check optimizer state was transferred
-    # ------------------------------------------------------------------ #
-    _section('OPTIMIZER STATE SANITY CHECK')
-
-    orig_params = {n: p for n, p in modmodel.named_parameters()}
-    inf_params  = {n: p for n, p in inf_modmodel.named_parameters()}
-
-    checked = 0
-    for name, orig_p in orig_params.items():
-        if orig_p not in orig_optimizer.state:
-            continue
-        if name not in inf_params:
-            continue
-        inf_p = inf_params[name]
-        if inf_p not in inf_optimizer.state:
-            print("  [MISSING] inf optimizer state for {}".format(name))
-            continue
-
-        orig_s = orig_optimizer.state[orig_p]
-        inf_s  = inf_optimizer.state[inf_p]
-
-        for key in ("exp_avg", "exp_avg_sq"):
-            if key not in orig_s:
-                continue
-            orig_t = orig_s[key]
-            inf_t  = inf_s[key]
-            print("  [{}] {}  orig shape={}  inf shape={}  inf norm={:.4f}".format(
-                key, name,
-                list(orig_t.shape), list(inf_t.shape),
-                inf_t.norm().item(),
-            ))
-        checked += 1
-
-    print("\n  Checked {} parameter(s) with optimizer state.".format(checked))
-    print("=" * 80)
-
-
-if __name__ == "__main__":
-    import os
-    _main(_get_args_parser().parse_args())
