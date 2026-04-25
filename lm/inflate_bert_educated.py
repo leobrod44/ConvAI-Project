@@ -1059,6 +1059,112 @@ def inflate_modBertLMPredictionHead(orig_layer, inf_layer, decoder_out_pattern):
 
 
 # ---------------------------------------------------------------------------
+# inflate_AKI -- AKI-style BERT inflation
+# ---------------------------------------------------------------------------
+
+def inflate_AKI(
+    orig_bert, inf_bert,
+    device='cpu',
+    inflate_new_layers=True,
+    out_mode='allzero',
+    ln_pattern='unif',
+    ln_bias_pattern='zero',
+    kqv_heads_pattern='circular',
+    kqv_out_pattern='circular',
+    kqv_in_pattern='zero',
+    proj_out_pattern='average',
+    mlp_out_pattern='average',
+    mlp_hidden_pattern='circular',
+    mlp_in_pattern='zero',
+    decoder_out_pattern='circular',
+    scale=0.1,
+):
+    """
+    AKI-style BERT inflation:
+    - normal mapped layers use mode='AKIproj'
+    - inserted depth layers also use mode='AKIproj'
+    """
+    assert isinstance(orig_bert, modBertForMaskedLM)
+    assert isinstance(inf_bert,  modBertForMaskedLM)
+
+    orig_depth = len(orig_bert.bert.encoder.layer)
+    inf_depth  = len(inf_bert.bert.encoder.layer)
+    assert orig_depth * 2 >= inf_depth
+
+    # embeddings
+    inflate_BertEmbeddings(
+        orig_bert.bert.embeddings, inf_bert.bert.embeddings,
+        pattern='average',
+        ln_pattern=ln_pattern,
+        ln_bias_pattern=ln_bias_pattern,
+    )
+
+    no_inflation_depth = 2 * orig_depth - inf_depth
+    orig_layers = orig_bert.bert.encoder.layer
+    inf_layers  = inf_bert.bert.encoder.layer
+
+    # Part 1: layers that map 1:1
+    for i in range(no_inflation_depth):
+        inflate_modBertLayer(
+            orig_layers[i], inf_layers[i],
+            kqv_heads_pattern=kqv_heads_pattern, kqv_out_pattern=kqv_out_pattern,
+            kqv_in_pattern=kqv_in_pattern, proj_out_pattern=proj_out_pattern,
+            mlp_out_pattern=mlp_out_pattern, mlp_hidden_pattern=mlp_hidden_pattern,
+            mlp_in_pattern=mlp_in_pattern,
+            ln_pattern=ln_pattern, ln_bias_pattern=ln_bias_pattern,
+            mode='AKIproj', out_mode=out_mode, device=device,
+            AKI_layer=orig_layers[i],
+            scalezero=scale, scalecirc=scale,
+            circ_mode='comp',
+        )
+
+    # Part 2: layers that map to (normal, inserted)
+    for i in range(no_inflation_depth, orig_depth):
+        ni = no_inflation_depth + (i - no_inflation_depth) * 2
+        zi = ni + 1
+
+        # normal mapped layer
+        inflate_modBertLayer(
+            orig_layers[i], inf_layers[ni],
+            kqv_heads_pattern=kqv_heads_pattern, kqv_out_pattern=kqv_out_pattern,
+            kqv_in_pattern=kqv_in_pattern, proj_out_pattern=proj_out_pattern,
+            mlp_out_pattern=mlp_out_pattern, mlp_hidden_pattern=mlp_hidden_pattern,
+            mlp_in_pattern=mlp_in_pattern,
+            ln_pattern=ln_pattern, ln_bias_pattern=ln_bias_pattern,
+            mode='AKIproj', out_mode=out_mode, device=device,
+            AKI_layer=orig_layers[i],
+            scalezero=scale, scalecirc=scale,
+            circ_mode='comp',
+        )
+
+        # inserted layer
+        if inflate_new_layers:
+            aki_layer = orig_layers[i if i == orig_depth - 1 else i + 1]
+            inflate_modBertLayer(
+                orig_layers[i], inf_layers[zi],
+                kqv_heads_pattern=kqv_heads_pattern, kqv_out_pattern=kqv_out_pattern,
+                kqv_in_pattern=kqv_in_pattern, proj_out_pattern=proj_out_pattern,
+                mlp_out_pattern=mlp_out_pattern, mlp_hidden_pattern=mlp_hidden_pattern,
+                mlp_in_pattern=mlp_in_pattern,
+                ln_pattern=ln_pattern, ln_bias_pattern=ln_bias_pattern,
+                mode='AKIproj', out_mode=out_mode, device=device,
+                AKI_layer=aki_layer,
+                scalezero=scale, scalecirc=scale,
+                circ_mode='comp',
+            )
+
+    inflate_ln(
+        orig_bert.bert.encoder.ln_f, inf_bert.bert.encoder.ln_f,
+        pattern=ln_pattern, bias_pattern=ln_bias_pattern,
+        scale_for_bert=True, device=device,
+    )
+    inflate_modBertLMPredictionHead(
+        orig_bert.cls.predictions, inf_bert.cls.predictions,
+        decoder_out_pattern=decoder_out_pattern,
+    )
+
+
+# ---------------------------------------------------------------------------
 # inflate_LEMON -- original LEMON recipe
 # ---------------------------------------------------------------------------
 
