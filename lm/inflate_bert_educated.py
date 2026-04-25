@@ -1081,18 +1081,18 @@ def inflate_AKI(
     inf_depth  = len(inf_bert.bert.encoder.layer)
     assert orig_depth * 2 >= inf_depth
 
-    out_mode='allzero',
-    ln_pattern='unif',
-    ln_bias_pattern='zero',
-    kqv_heads_pattern='circular',
-    kqv_out_pattern='circular',
-    kqv_in_pattern='zero',
-    proj_out_pattern='average',
-    mlp_out_pattern='average',
-    mlp_hidden_pattern='circular',
-    mlp_in_pattern='zero',
-    decoder_out_pattern='circular',
-    
+    out_mode='allzero'
+    ln_pattern='unif'
+    ln_bias_pattern='zero'
+    kqv_heads_pattern='circular'
+    kqv_out_pattern='circular'
+    kqv_in_pattern='zero'
+    proj_out_pattern='average'
+    mlp_out_pattern='average'
+    mlp_hidden_pattern='circular'
+    mlp_in_pattern='zero'
+    decoder_out_pattern='circular'
+
     # embeddings
     inflate_BertEmbeddings(
         orig_bert.bert.embeddings, inf_bert.bert.embeddings,
